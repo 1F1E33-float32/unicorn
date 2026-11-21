@@ -37,6 +37,39 @@
 #include "qemu-common.h"
 #include "sysemu/sysemu.h"
 
+#if defined(_WIN64) && defined(_MSC_VER)
+/* Keep the assembly context restore in sync with the MSVC jump buffer ABI. */
+#define CHECK_JUMP_OFFSET(field, offset)                                       \
+    _Static_assert(offsetof(_JUMP_BUFFER, field) == (offset),                  \
+                   "Unexpected MSVC jump buffer offset: " #field)
+
+_Static_assert(sizeof(jmp_buf) == 256, "Unexpected MSVC jump buffer size");
+CHECK_JUMP_OFFSET(Rbx, 0x08);
+CHECK_JUMP_OFFSET(Rsp, 0x10);
+CHECK_JUMP_OFFSET(Rbp, 0x18);
+CHECK_JUMP_OFFSET(Rsi, 0x20);
+CHECK_JUMP_OFFSET(Rdi, 0x28);
+CHECK_JUMP_OFFSET(R12, 0x30);
+CHECK_JUMP_OFFSET(R13, 0x38);
+CHECK_JUMP_OFFSET(R14, 0x40);
+CHECK_JUMP_OFFSET(R15, 0x48);
+CHECK_JUMP_OFFSET(Rip, 0x50);
+CHECK_JUMP_OFFSET(MxCsr, 0x58);
+CHECK_JUMP_OFFSET(FpCsr, 0x5C);
+CHECK_JUMP_OFFSET(Xmm6, 0x60);
+CHECK_JUMP_OFFSET(Xmm7, 0x70);
+CHECK_JUMP_OFFSET(Xmm8, 0x80);
+CHECK_JUMP_OFFSET(Xmm9, 0x90);
+CHECK_JUMP_OFFSET(Xmm10, 0xA0);
+CHECK_JUMP_OFFSET(Xmm11, 0xB0);
+CHECK_JUMP_OFFSET(Xmm12, 0xC0);
+CHECK_JUMP_OFFSET(Xmm13, 0xD0);
+CHECK_JUMP_OFFSET(Xmm14, 0xE0);
+CHECK_JUMP_OFFSET(Xmm15, 0xF0);
+
+#undef CHECK_JUMP_OFFSET
+#endif
+
 void *qemu_oom_check(void *ptr)
 {
     if (ptr == NULL) {

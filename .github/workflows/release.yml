@@ -1,53 +1,216 @@
+name: Build and Publish Release
+
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag, for example v2.1.4-longjmp.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
-name: Upload Release Assets
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  build:
-    name: Upload Release Assets
-    runs-on: ubuntu-latest
+  metadata:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+      - name: Validate release version
+        id: version
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+          import subprocess
+
+          tag = os.environ['RELEASE_TAG']
+          match = re.fullmatch(r'v(\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?)', tag)
+          if not match:
+              raise SystemExit('Expected a version tag such as v2.1.4-longjmp.1')
+          version = match[1]
+          cmake = pathlib.Path('CMakeLists.txt').read_text()
+          native_version = '.'.join(re.search(rf'set\(UNICORN_VERSION_{part} (\d+)\)', cmake)[1]
+                                    for part in ('MAJOR', 'MINOR', 'PATCH'))
+          if version.split('-')[0] != native_version:
+              raise SystemExit(f'Tag version must match native version {native_version}')
+          commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'tag={tag}\nversion={version}\ncommit={commit}\n')
+          PY
+
+  native:
+    needs: metadata
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { rid: win-x64, runner: windows-2022, msvc_arch: x64 }
+          - { rid: win-x86, runner: windows-2022, msvc_arch: Win32 }
+          - { rid: linux-x64, runner: ubuntu-22.04 }
+          - { rid: linux-arm64, runner: ubuntu-22.04-arm }
+          - { rid: osx-x64, runner: macos-15-intel, macos_arch: x86_64 }
+          - { rid: osx-arm64, runner: macos-15, macos_arch: arm64 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
         with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
-          draft: true
-          prerelease: false
-                
-      - name: create artifacts directory
-        run: mkdir artifact
-        working-directory: ./
-
-      - uses: dawidd6/action-download-artifact@v6
-        id: download-artifact
-        with:
-          workflow: build-uc2.yml
-          workflow_conclusion: success
-          branch: master
-          path: artifact
-
-      - name: Display structure of downloaded files
-        run: ls -R
-        working-directory: artifact
-
-
-      - name: Upload Release Assets
-        id: upload-release-assets
-        uses: dwenegar/upload-release-assets@v1
+          ref: ${{ needs.metadata.outputs.commit }}
+      - name: Configure Windows
+        if: runner.os == 'Windows'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MSVC_ARCH: ${{ matrix.msvc_arch }}
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A "$MSVC_ARCH" \
+            -DBUILD_SHARED_LIBS=ON -DUNICORN_LEGACY_STATIC_ARCHIVE=OFF \
+            -DUNICORN_BUILD_TESTS=OFF -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+            -DCMAKE_INSTALL_PREFIX="$PWD/stage" -DCMAKE_INSTALL_LIBDIR=lib
+      - name: Configure Linux and macOS
+        if: runner.os != 'Windows'
+        env:
+          MACOS_ARCH: ${{ matrix.macos_arch }}
+        run: |
+          options=()
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            options+=("-DCMAKE_OSX_ARCHITECTURES=$MACOS_ARCH")
+          fi
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON -DUNICORN_LEGACY_STATIC_ARCHIVE=OFF \
+            -DUNICORN_BUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX="$PWD/stage" \
+            -DCMAKE_INSTALL_LIBDIR=lib "${options[@]}"
+      - name: Build and install
+        run: |
+          cmake --build build --target unicorn --config Release --parallel 2
+          cmake --install build --config Release
+          cp COPYING COPYING.LGPL2 COPYING_GLIB AUTHORS.TXT CREDITS.TXT stage/
+      - name: Archive native SDK
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          RID: ${{ matrix.rid }}
+        run: |
+          mkdir -p dist
+          tar -czf "dist/unicorn-$RELEASE_TAG-$RID.tar.gz" -C stage .
+      - uses: actions/upload-artifact@v4
         with:
-          release_id: ${{ steps.create_release.outputs.id }}
-          assets_path: artifact
+          name: native-${{ matrix.rid }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  package:
+    needs: [metadata, native]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.commit }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: native
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Stage native libraries for NuGet
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import shutil
+          import tarfile
+
+          paths = {
+              'win-x64': 'bin/unicorn.dll',
+              'win-x86': 'bin/unicorn.dll',
+              'linux-x64': 'lib/libunicorn.so',
+              'linux-arm64': 'lib/libunicorn.so',
+              'osx-x64': 'lib/libunicorn.dylib',
+              'osx-arm64': 'lib/libunicorn.dylib',
+          }
+          for rid, library in paths.items():
+              archive = pathlib.Path('native') / f"unicorn-{os.environ['RELEASE_TAG']}-{rid}.tar.gz"
+              extracted = pathlib.Path('staged') / rid
+              with tarfile.open(archive) as source:
+                  source.extractall(extracted, filter='data')
+              source = extracted / library
+              destination = pathlib.Path('bindings/dotnet/UnicornEngine/runtimes') / rid / 'native'
+              destination.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(source, destination / source.name)
+          PY
+      - name: Pack NuGet package
+        env:
+          PACKAGE_VERSION: ${{ needs.metadata.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.metadata.outputs.commit }}
+        run: |
+          dotnet pack bindings/dotnet/UnicornEngine/UnicornEngine.fsproj -c Release \
+            -p:PackageVersion="$PACKAGE_VERSION" -p:RepositoryCommit="$SOURCE_COMMIT" \
+            -p:RepositoryUrl="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" -o dist
+          cp native/*.tar.gz dist/
+      - name: Generate checksums
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import pathlib
+
+          files = sorted(pathlib.Path('dist').iterdir())
+          with open('dist/SHA256SUMS', 'w') as output:
+              for path in files:
+                  with path.open('rb') as source:
+                      digest = hashlib.file_digest(source, 'sha256').hexdigest()
+                  output.write(f'{digest}  {path.name}\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [metadata, package]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          PACKAGE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --title "$RELEASE_TAG" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+          if [[ "$PACKAGE_VERSION" == *-* ]]; then
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease
+          else
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease=false
+          fi

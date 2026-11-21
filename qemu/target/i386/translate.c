@@ -2806,7 +2806,7 @@ static void gen_reset_hflag(DisasContext *s, uint32_t mask)
         tcg_gen_andi_i32(tcg_ctx, t, t, ~mask);
         tcg_gen_st_i32(tcg_ctx, t, tcg_ctx->cpu_env, offsetof(CPUX86State, hflags));
         tcg_temp_free_i32(tcg_ctx, t);
-        s->flags &= ~mask;
+        s->flags &= (target_ulong)(~mask);
     }
 }
 

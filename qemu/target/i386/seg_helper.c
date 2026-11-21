@@ -2055,7 +2055,8 @@ void helper_iret_real(CPUX86State *env, int shift)
         POPW_RA(ssp, sp, sp_mask, new_cs, GETPC());
         POPW_RA(ssp, sp, sp_mask, new_eflags, GETPC());
     }
-    env->regs[R_ESP] = (env->regs[R_ESP] & ~sp_mask) | (sp & sp_mask);
+    env->regs[R_ESP] =
+        (env->regs[R_ESP] & (target_ulong)(~sp_mask)) | (sp & sp_mask);
     env->segs[R_CS].selector = new_cs;
     env->segs[R_CS].base = (new_cs << 4);
     env->eip = new_eip;

@@ -22,7 +22,6 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Include="WinNativeImport.fs" />
     <Compile Include="Const\Arm.fs" />
     <Compile Include="Const\Arm64.fs" />
     <Compile Include="Const\Common.fs" />
